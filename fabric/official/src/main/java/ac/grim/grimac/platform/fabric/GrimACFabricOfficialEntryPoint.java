@@ -14,7 +14,7 @@ public class GrimACFabricOfficialEntryPoint extends AbstractGrimACFabricEntryPoi
         initialize(
                 "grim26MainLoad",
                 GrimACFabricOfficialLoaderPlugin.class,
-                true
+                false
         );
     }
 
