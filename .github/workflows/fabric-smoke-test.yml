@@ -116,6 +116,8 @@ jobs:
                       grep -E 'Loaded Fabric platform|Registering packets|Grim Version|grim-datastore\].*(complete|disabled|failed)|No Fabric platform entrypoint' "log-$name.txt" || true
                       echo "----- [$name] errors -----"
                       grep -E '/ERROR\]|Exception|SEVERE' "log-$name.txt" | head -40 || true
+                      echo "----- [$name] full crash -----"
+                      grep -A60 'A mod crashed on startup' "log-$name.txt" | grep -vE '^\s+at (java\.|jdk\.|net\.fabricmc\.loader)' | head -80 || true
                   }
 
                   status=0
@@ -135,6 +137,33 @@ jobs:
                   done
                   exit $status
 
+            - name: Bisect - boot GrimAC with each extra mod on its own
+              if: always()
+              run: |
+                  set -uo pipefail
+                  cd server
+                  mkdir -p ../extra && mv mods/*.jar ../extra/ 2>/dev/null || true
+                  cp ../extra/fabric-api.jar ../extra/grimac-fabric-*.jar mods/
+                  try() {
+                      local label=$1
+                      ( java -Xmx3G -cp fabric-server.jar:sqlite-jdbc.jar net.fabricmc.installer.ServerLauncher nogui < /dev/null > "bisect-$label.txt" 2>&1 ) &
+                      for i in $(seq 1 240); do
+                          grep -q 'Done (' "bisect-$label.txt" && { echo "OK      $label"; break; }
+                          grep -qE 'A mod crashed on startup|Incompatible mods found|Failed to start' "bisect-$label.txt" && {
+                              echo "CRASH   $label"; grep -E 'Caused by|Provider|provider' "bisect-$label.txt" | head -6 | sed 's/^/          /'; break; }
+                          sleep 0.5
+                      done
+                      pkill -9 -f 'fabric-server.jar' || true; sleep 1
+                  }
+                  try grim-only
+                  for jar in ../extra/*.jar; do
+                      b=$(basename "$jar")
+                      [[ "$b" == fabric-api.jar || "$b" == grimac-fabric-* ]] && continue
+                      cp "$jar" mods/
+                      try "${b%.jar}"
+                      rm -f "mods/$b"
+                  done
+
             - name: Upload server logs
               if: always()
               uses: actions/upload-artifact@v6
@@ -142,5 +171,6 @@ jobs:
                   name: fabric-smoke-test-logs
                   path: |
                       server/log-*.txt
+                      server/bisect-*.txt
                       server/logs/
                   if-no-files-found: warn
