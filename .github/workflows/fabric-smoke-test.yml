@@ -1,12 +1,9 @@
 name: Fabric 26.2 Smoke Test
 
-# Boots a real Fabric 26.2 dedicated server with GrimAC and the SQLite driver
-# on the classpath (so Grim's datastore actually starts), then simulates a
-# crash (kill -9) followed by an immediate restart. That restart is the case
-# where the previous run's datastore ownership lease is still live.
-#
-# The scenario runs twice: once with the original code (BASE_REF) and once
-# with this branch, so the restart times can be compared directly.
+# Boots a real Fabric 26.2 dedicated server with the freshly built GrimAC jar,
+# alongside a modpack matching a reported production server, and checks that
+# GrimAC loads and starts. It also crashes the server (kill -9) and restarts
+# it immediately to make sure Grim recovers from an unclean shutdown.
 on:
     workflow_dispatch:
     push:
@@ -16,18 +13,20 @@ on:
 jobs:
     smoke-test:
         runs-on: ubuntu-latest
-        timeout-minutes: 60
+        timeout-minutes: 45
         permissions:
             contents: read
 
         env:
             MC_VERSION: '26.2'
-            FABRIC_API_VERSION: '0.152.1+26.2'
+            LOADER_VERSION: '0.19.5'
+            FABRIC_API_VERSION: '0.161.0+26.2'
             SQLITE_JDBC_VERSION: '3.46.1.3'
-            BASE_REF: 'abb95b6cac22643ff2cf0b9bc63909daebadf4c6'
+            # Modrinth slugs of other mods to load next to Grim (skipped if no 26.2 build exists).
+            EXTRA_MODS: 'lithium c2me-fabric krypton ferrite-core modernfix vmp-fabric scalablelux spark simple-voice-chat yacl'
 
         steps:
-            - name: Checkout repository with full history
+            - name: Checkout repository
               uses: actions/checkout@v4
               with:
                   persist-credentials: false
@@ -44,117 +43,97 @@ jobs:
               with:
                   cache-read-only: true
 
-            - name: Build this branch
+            - name: Build GrimAC (Fabric)
               run: |
                   echo "GRIM_GIT_REPO=${{ github.event.repository.name }}" >> $GITHUB_ENV
                   echo "GRIM_GIT_ORG=${{ github.repository_owner }}" >> $GITHUB_ENV
                   ./gradlew :fabric:build
-                  mkdir -p jars/fixed && cp fabric/build/libs/grimac-fabric-*.jar jars/fixed/
 
-            - name: Build original code (base)
-              run: |
-                  git worktree add ../grim-base "$BASE_REF"
-                  (cd ../grim-base && ./gradlew :fabric:build)
-                  mkdir -p jars/base && cp ../grim-base/fabric/build/libs/grimac-fabric-*.jar jars/base/
-
-            - name: Download Fabric server, Fabric API and SQLite driver
+            - name: Prepare Fabric server
               run: |
                   set -euo pipefail
-                  mkdir -p dl
-                  LOADER=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/loader/${MC_VERSION}" | jq -r '.[0].loader.version')
+                  mkdir -p server/mods
                   INSTALLER=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/installer" | jq -r '.[0].version')
-                  echo "Fabric loader $LOADER, installer $INSTALLER"
-                  curl -fsSL -o dl/fabric-server.jar \
-                      "https://meta.fabricmc.net/v2/versions/loader/${MC_VERSION}/${LOADER}/${INSTALLER}/server/jar"
-                  curl -fsSL -o dl/fabric-api.jar \
+                  curl -fsSL -o server/fabric-server.jar \
+                      "https://meta.fabricmc.net/v2/versions/loader/${MC_VERSION}/${LOADER_VERSION}/${INSTALLER}/server/jar"
+                  curl -fsSL -o "server/mods/fabric-api.jar" \
                       "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/${FABRIC_API_VERSION}/fabric-api-${FABRIC_API_VERSION}.jar"
-                  curl -fsSL -o dl/sqlite-jdbc.jar \
+                  curl -fsSL -o server/sqlite-jdbc.jar \
                       "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/${SQLITE_JDBC_VERSION}/sqlite-jdbc-${SQLITE_JDBC_VERSION}.jar"
+                  cp fabric/build/libs/grimac-fabric-*.jar server/mods/
 
-            - name: Crash and restart scenario (base vs fixed)
+                  for slug in $EXTRA_MODS; do
+                      url=$(curl -fsSL -G "https://api.modrinth.com/v2/project/${slug}/version" \
+                              --data-urlencode "game_versions=[\"${MC_VERSION}\"]" \
+                              --data-urlencode 'loaders=["fabric"]' 2>/dev/null \
+                            | jq -r '[.[] | .files[] | select(.primary == true) | .url][0] // empty' || true)
+                      if [[ -n "$url" ]]; then
+                          curl -fsSL -o "server/mods/${slug}.jar" "$url" && echo "added $slug"
+                      else
+                          echo "skipped $slug (no ${MC_VERSION} fabric build found)"
+                      fi
+                  done
+                  ls -la server/mods
+                  echo "eula=true" > server/eula.txt
+                  printf 'online-mode=false\nlevel-type=minecraft\\:flat\nview-distance=4\nsimulation-distance=4\n' > server/server.properties
+
+            - name: Boot, crash and restart
               run: |
                   set -uo pipefail
+                  cd server
 
-                  setup_server() {
-                      local dir=$1 variant=$2
-                      rm -rf "$dir"; mkdir -p "$dir/mods"
-                      cp dl/fabric-server.jar dl/sqlite-jdbc.jar "$dir/"
-                      cp dl/fabric-api.jar "$dir/mods/"
-                      cp jars/$variant/grimac-fabric-*.jar "$dir/mods/"
-                      echo "eula=true" > "$dir/eula.txt"
-                      printf 'online-mode=false\nlevel-type=minecraft\\:flat\nview-distance=4\nsimulation-distance=4\n' > "$dir/server.properties"
-                  }
-
-                  # boot <dir> <name>: start the server and wait for "Done (". Prints wall-clock seconds.
                   boot() {
-                      local dir=$1 name=$2
-                      : > "$dir/cmd-$name.txt"
-                      ( cd "$dir" && tail -f "cmd-$name.txt" | java -Xmx2G -cp fabric-server.jar:sqlite-jdbc.jar net.fabricmc.installer.ServerLauncher nogui > "log-$name.txt" 2>&1 ) &
+                      local name=$1
+                      : > "cmd-$name.txt"
+                      ( tail -f "cmd-$name.txt" | java -Xmx3G -cp fabric-server.jar:sqlite-jdbc.jar net.fabricmc.installer.ServerLauncher nogui > "log-$name.txt" 2>&1 ) &
                       local start=$(date +%s)
                       for i in $(seq 1 900); do
-                          if grep -q 'Done (' "$dir/log-$name.txt"; then
-                              BOOT_SECS=$(( $(date +%s) - start ))
-                              echo "[$dir/$name] Done after ${BOOT_SECS}s wall clock; server reports $(grep -o 'Done ([0-9.]*s)' "$dir/log-$name.txt" | head -1)"
+                          if grep -q 'Done (' "log-$name.txt"; then
+                              echo "[$name] Done after $(( $(date +%s) - start ))s"
                               return 0
                           fi
-                          if grep -qE 'Exception in server tick loop|Failed to start the minecraft server|Incompatible mods found|Could not execute entrypoint' "$dir/log-$name.txt"; then
-                              echo "[$dir/$name] SERVER FAILED TO START"; BOOT_SECS=-1; return 1
+                          if ! pgrep -f 'fabric-server.jar' > /dev/null && [[ $i -gt 10 ]]; then
+                              echo "[$name] SERVER EXITED BEFORE STARTING"; return 1
                           fi
                           sleep 0.5
                       done
-                      echo "[$dir/$name] TIMED OUT"; BOOT_SECS=-1; return 1
+                      echo "[$name] TIMED OUT"; return 1
                   }
 
                   stop_clean() {
-                      local dir=$1 name=$2
-                      echo stop >> "$dir/cmd-$name.txt"
-                      for i in $(seq 1 120); do
-                          pgrep -f 'fabric-server.jar' > /dev/null || break
-                          sleep 0.5
-                      done
+                      local name=$1
+                      echo stop >> "cmd-$name.txt"
+                      for i in $(seq 1 120); do pgrep -f 'fabric-server.jar' > /dev/null || break; sleep 0.5; done
                       pkill -9 -f 'fabric-server.jar' || true
-                      pkill -f "tail -f cmd-$name.txt" || true
-                  }
-
-                  crash() {
-                      local name=$2
-                      pkill -9 -f 'fabric-server.jar' || true
-                      sleep 1
                       pkill -f "tail -f cmd-$name.txt" || true
                   }
 
                   report() {
-                      local dir=$1 name=$2
-                      echo "----- [$dir/$name] Grim datastore / startup lines -----"
-                      grep -E 'grim-datastore|ownership|Registering packets|Loaded Fabric platform|Grim Version|SQLite JDBC' "$dir/log-$name.txt" | grep -v '^\s*at ' | head -40 || true
+                      local name=$1
+                      echo "----- [$name] mods -----"
+                      grep -E '^\s+- ' "log-$name.txt" | head -40 || true
+                      echo "----- [$name] GrimAC lines -----"
+                      grep -E 'Loaded Fabric platform|Registering packets|Grim Version|grim-datastore\].*(complete|disabled|failed)|No Fabric platform entrypoint' "log-$name.txt" || true
+                      echo "----- [$name] errors -----"
+                      grep -E '/ERROR\]|Exception|SEVERE' "log-$name.txt" | head -40 || true
                   }
 
-                  scenario() {
-                      local variant=$1 dir="server-$1"
-                      echo "=================== $variant ==================="
-                      setup_server "$dir" "$variant"
-                      boot "$dir" warmup; stop_clean "$dir" warmup        # first boot creates world + DB
-                      boot "$dir" before-crash; sleep 15; report "$dir" before-crash
-                      crash "$dir" before-crash
-                      boot "$dir" after-crash; local secs=$BOOT_SECS
-                      sleep 25; report "$dir" after-crash
-                      stop_clean "$dir" after-crash
-                      eval "RESTART_${variant}=$secs"
-                  }
+                  status=0
+                  boot first || status=1
+                  sleep 20; report first
+                  pkill -9 -f 'fabric-server.jar' || true; sleep 1; pkill -f 'tail -f cmd-first.txt' || true
+                  echo "[first] killed with SIGKILL"
 
-                  scenario base
-                  scenario fixed
+                  boot second || status=1
+                  sleep 20; report second
+                  stop_clean second
 
-                  echo "=================== SUMMARY ==================="
-                  echo "Restart right after kill -9, time to 'Done':"
-                  echo "  original code: ${RESTART_base}s"
-                  echo "  this branch:   ${RESTART_fixed}s"
-                  for v in base fixed; do
-                      f="server-$v/log-after-crash.txt"
-                      grep -q 'waiting .*ms for the ownership lease' "$f" && echo "  [$v] waited on the previous run's ownership lease" || echo "  [$v] no ownership lease wait"
-                      grep -q 'v2 cutover complete' "$f" && echo "  [$v] datastore started" || echo "  [$v] datastore did NOT start"
-                      grep -q 'Registering packets' "$f" && echo "  [$v] GrimAC started" || echo "  [$v] GrimAC did NOT start"
+                  echo "===== RESULT ====="
+                  for n in first second; do
+                      grep -q 'Loaded Fabric platform' "log-$n.txt" && echo "[$n] GrimAC 26.x platform loaded" || { echo "[$n] GrimAC platform NOT loaded"; status=1; }
+                      grep -q 'Registering packets' "log-$n.txt" && echo "[$n] GrimAC started" || { echo "[$n] GrimAC did NOT start"; status=1; }
                   done
+                  exit $status
 
             - name: Upload server logs
               if: always()
@@ -162,6 +141,6 @@ jobs:
               with:
                   name: fabric-smoke-test-logs
                   path: |
-                      server-*/log-*.txt
-                      server-*/logs/
+                      server/log-*.txt
+                      server/logs/
                   if-no-files-found: warn
