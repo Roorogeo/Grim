@@ -32,6 +32,15 @@ dependencies {
     include(project(":fabric:intermediary"))
     include(project(":fabric:official"))
     include(libs.packetevents.fabric)
+
+    // Other mods (e.g. spark) ship a META-INF/services entry naming adventure's
+    // GsonDataComponentValueConverterProvider without the class itself. PacketEvents'
+    // adventure runs a ServiceLoader over every mod during preLaunch, so the dangling
+    // entry crashes startup. Bundling the gson serializer makes that provider resolvable.
+    include(libs.adventure.text.serializer.gson)
+    include(libs.adventure.text.serializer.json)
+    include(libs.adventure.text.serializer.commons)
+    include(libs.kyori.option)
 }
 
 publishing.publications.create<MavenPublication>("maven") {

@@ -147,12 +147,14 @@ jobs:
                   try() {
                       local label=$1
                       ( java -Xmx3G -cp fabric-server.jar:sqlite-jdbc.jar net.fabricmc.installer.ServerLauncher nogui < /dev/null > "bisect-$label.txt" 2>&1 ) &
+                      local result="TIMEOUT $label"
                       for i in $(seq 1 240); do
-                          grep -q 'Done (' "bisect-$label.txt" && { echo "OK      $label"; break; }
+                          grep -q 'Done (' "bisect-$label.txt" && { result="OK      $label"; break; }
                           grep -qE 'A mod crashed on startup|Incompatible mods found|Failed to start' "bisect-$label.txt" && {
-                              echo "CRASH   $label"; grep -E 'Caused by|Provider|provider' "bisect-$label.txt" | head -6 | sed 's/^/          /'; break; }
+                              result="CRASH   $label"; grep -E 'Caused by|Provider|provider' "bisect-$label.txt" | head -6 | sed 's/^/          /'; break; }
                           sleep 0.5
                       done
+                      echo "$result"
                       pkill -9 -f 'fabric-server.jar' || true; sleep 1
                   }
                   try grim-only
