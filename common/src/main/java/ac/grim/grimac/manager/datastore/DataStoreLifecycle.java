@@ -109,18 +109,18 @@ public final class DataStoreLifecycle implements StartableInitable, StoppableIni
     private final Logger logger;
     private final BackendRegistry backendRegistry;
 
-    private volatile DataStoreConfig config;
-    private volatile DataStoreImpl dataStore;
-    private volatile CheckRegistry checkRegistry;
-    private volatile VerboseRegistry verboseRegistry;
-    private volatile HistoryServiceImpl historyService;
+    private DataStoreConfig config;
+    private DataStoreImpl dataStore;
+    private CheckRegistry checkRegistry;
+    private VerboseRegistry verboseRegistry;
+    private HistoryServiceImpl historyService;
     private PlayerIdentityService playerIdentityService;
-    private volatile NameResolver nameResolver;
-    private volatile ViolationSinkImpl violationSink;
+    private NameResolver nameResolver;
+    private ViolationSinkImpl violationSink;
     private RetentionSweeper retentionSweeper;
-    private volatile SessionTracker sessionTracker = SessionTracker.NOOP;
-    private volatile LiveWriteHooks liveWriteHooks = LiveWriteHooks.NOOP;
-    private volatile PlayerToggleStore playerToggleStore = PlayerToggleStore.NOOP;
+    private SessionTracker sessionTracker = SessionTracker.NOOP;
+    private LiveWriteHooks liveWriteHooks = LiveWriteHooks.NOOP;
+    private PlayerToggleStore playerToggleStore = PlayerToggleStore.NOOP;
     private V2InstanceRegistry instanceRegistry;
     private HeartbeatScheduler heartbeatScheduler;
     private OwnershipHeartbeatScheduler ownershipHeartbeatScheduler;
@@ -135,14 +135,9 @@ public final class DataStoreLifecycle implements StartableInitable, StoppableIni
     private ScheduledExecutorService recoverySweepExecutor;
 
     @Getter
-    private volatile boolean enabled = true;
+    private boolean enabled = true;
     @Getter
-    private volatile boolean loaded;
-
-    // Startup can block for up to ownership.startup-wait-ms while a previous run's lease expires
-    // (e.g. after a crash or a fast restart), so it must never run on the server thread.
-    private volatile Thread startupThread;
-    private volatile boolean stopping;
+    private boolean loaded;
 
     private final List<BackendV2> v2Backends = new ArrayList<>();
 
@@ -154,21 +149,6 @@ public final class DataStoreLifecycle implements StartableInitable, StoppableIni
 
     @Override
     public void start() {
-        stopping = false;
-        Thread thread = new Thread(() -> {
-            try {
-                startNow();
-            } catch (Throwable t) {
-                logger.log(Level.SEVERE, "[grim-datastore] unexpected failure during background storage startup", t);
-            }
-        }, "grim-datastore-startup");
-        thread.setDaemon(true);
-        startupThread = thread;
-        thread.start();
-    }
-
-    private synchronized void startNow() {
-        if (stopping) return;
         Path dataFolder = plugin.getDataFolder().toPath();
         DataStoreConfigBuilder builder = new DataStoreConfigBuilder(
                 backendRegistry,
@@ -197,7 +177,7 @@ public final class DataStoreLifecycle implements StartableInitable, StoppableIni
             logger.log(Level.SEVERE, "[grim-datastore] fatal storage startup failure - shutting down server", e);
             try { close(); } catch (Exception closeEx) { logger.log(Level.FINE, "[grim-datastore] close during shutdown failed", closeEx); }
             this.enabled = false;
-            if (!stopping) shutdownServerAfterFatalStorageStartup();
+            shutdownServerAfterFatalStorageStartup();
         } catch (Exception | LinkageError e) {
             logger.log(Level.SEVERE, "[grim-datastore] failed to initialise storage - falling back to disabled", e);
             try { close(); } catch (Exception closeEx) { logger.log(Level.FINE, "[grim-datastore] close during fallback failed", closeEx); }
@@ -1056,30 +1036,13 @@ public final class DataStoreLifecycle implements StartableInitable, StoppableIni
 
     @Override
     public void stop() {
-        stopping = true;
-        awaitStartupThread();
         close();
     }
 
-    public void reload() {
-        awaitStartupThread();
-        synchronized (this) {
-            logger.info("[grim-datastore] /grim reload: tearing down datastore...");
-            close();
-            startNow();
-        }
-    }
-
-    private void awaitStartupThread() {
-        Thread thread = startupThread;
-        if (thread == null || thread == Thread.currentThread()) return;
-        // Wake a startup that is still waiting out an ownership lease so shutdown isn't delayed by it.
-        if (stopping) thread.interrupt();
-        try {
-            thread.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+    public synchronized void reload() {
+        logger.info("[grim-datastore] /grim reload: tearing down datastore...");
+        close();
+        start();
     }
 
     private synchronized void close() {
